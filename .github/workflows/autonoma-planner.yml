@@ -1,0 +1,121 @@
+# Full-scan this Dolibarr fork with Autonoma Planner (unattended).
+name: Autonoma Planner · Dolibarr full scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to scan (branch/tag/SHA). Empty = this workflow's branch."
+        required: false
+        default: ""
+      fresh:
+        description: "Discard previous planner progress (--fresh)"
+        type: boolean
+        default: false
+      coding_agent:
+        description: "Coding agent for preview/SDK steps (claude|codex|none)"
+        required: true
+        default: "none"
+
+concurrency:
+  group: autonoma-planner-dolibarr0814
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Full-scan Dolibarr with Planner
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this fork (full tree, shallow history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
+          fetch-depth: 1
+
+      - name: Show tree size
+        run: |
+          echo "ref=$(git rev-parse --short HEAD) name=$(git rev-parse --abbrev-ref HEAD)"
+          du -sh .
+          if [ -d htdocs ]; then
+            find htdocs -type f | wc -l | xargs -I{} echo "htdocs_files={}"
+          else
+            echo "::error::htdocs/ not found — is this a Dolibarr tree?"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Claude Code CLI (optional)
+        if: ${{ inputs.coding_agent == 'claude' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::warning::ANTHROPIC_API_KEY 未配置：预览/SDK 步骤可能跳过或失败，仍会尽量生成套件"
+            exit 0
+          fi
+          npm install -g @anthropic-ai/claude-code
+          claude --version || true
+
+      - name: Require Autonoma secrets
+        env:
+          AUTONOMA_API_TOKEN: ${{ secrets.AUTONOMA_API_TOKEN }}
+          AUTONOMA_APPLICATION_ID: ${{ secrets.AUTONOMA_APPLICATION_ID }}
+          AUTONOMA_GENERATION_ID: ${{ secrets.AUTONOMA_GENERATION_ID }}
+        run: |
+          missing=0
+          for k in AUTONOMA_API_TOKEN AUTONOMA_APPLICATION_ID AUTONOMA_GENERATION_ID; do
+            if [ -z "${!k}" ]; then
+              echo "::error::缺少 Secret: $k"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Run Autonoma Planner (non-interactive)
+        env:
+          AUTONOMA_API_TOKEN: ${{ secrets.AUTONOMA_API_TOKEN }}
+          AUTONOMA_APPLICATION_ID: ${{ secrets.AUTONOMA_APPLICATION_ID }}
+          AUTONOMA_GENERATION_ID: ${{ secrets.AUTONOMA_GENERATION_ID }}
+          AUTONOMA_SHARED_SECRET: ${{ secrets.AUTONOMA_SHARED_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CI: true
+          FRESH: ${{ inputs.fresh }}
+          CODING_AGENT: ${{ inputs.coding_agent }}
+        run: |
+          set -euxo pipefail
+          FRESH_FLAG=""
+          if [ "$FRESH" = "true" ]; then
+            FRESH_FLAG="--fresh"
+          fi
+
+          if [ "$CODING_AGENT" = "none" ]; then
+            npx --yes @autonoma-ai/planner@latest --non-interactive \
+              --frontend htdocs \
+              --backend htdocs \
+              $FRESH_FLAG || true
+            npx --yes @autonoma-ai/planner@latest upload || true
+            npx --yes @autonoma-ai/planner@latest status || true
+          else
+            npx --yes @autonoma-ai/planner@latest --non-interactive \
+              --coding-agent "$CODING_AGENT" \
+              --frontend htdocs \
+              --backend htdocs \
+              --permission-mode bypassPermissions \
+              $FRESH_FLAG
+          fi
+
+      - name: Upload local planner artifacts (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autonoma-artifacts-${{ github.run_id }}
+          path: |
+            ~/.autonoma/**
+          if-no-files-found: warn
+          retention-days: 14
